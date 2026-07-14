@@ -1145,8 +1145,10 @@ def api_datasets_ingest():
         payload, skipped = parse_offgrid_backup(raw)
     except BackupValidationError as err:
         return jsonify({"error": str(err)}), 400
-    counts = dataset_store.ingest(payload)
+    branch = request.args.get("branch", "main")
+    counts = dataset_store.ingest(payload, branch=branch)
     counts["skipped"] = skipped
+    counts["branch"] = branch.strip() or "main"
     return jsonify(counts), 200
 
 
@@ -1168,6 +1170,156 @@ def api_datasets_stats():
     if not dataset_store:
         return jsonify({"error": "dataset store not ready"}), 503
     return jsonify(dataset_store.stats())
+
+# ============================================================================
+# ROUTER FORGE — generate router artifacts at any size, attach them to anything
+# Routers answer route(text) -> {label, confidence, scores}. Train nano routers
+# (under 1 MB, run anywhere) from your ingested datasets or raw examples; forge
+# llm prompt-spec routers instantly; export artifacts to attach on any tier.
+# ============================================================================
+
+forge_store = None
+try:
+    from router_forge import (
+        ForgeStore, RouterRuntime, ForgeError,
+        train_nano, build_embed, build_llm, build_fetch_script,
+        ollama_embed_fn,
+    )
+    forge_store = ForgeStore(os.environ.get("JACKY_FORGE_DB", "jacky_forge.db"))
+except Exception as e:  # pragma: no cover - import guard mirrors engine init style
+    log.warning(f"Router forge unavailable: {e}")
+
+
+def _forge_examples_from_request(data):
+    """Resolve training examples from the request: raw pairs or the datasets."""
+    raw = data.get("examples")
+    if isinstance(raw, list):
+        return [(e.get("text"), e.get("label")) for e in raw if isinstance(e, dict)]
+    spec = data.get("fromDatasets")
+    if isinstance(spec, dict):
+        if not dataset_store:
+            raise ForgeError("Dataset store is not ready; cannot pull examples.")
+        return dataset_store.labeled_examples(
+            label_by=spec.get("labelBy", "project_id"),
+            role=spec.get("role", "user"),
+            branch=spec.get("branch"),
+            min_per_label=int(spec.get("minPerLabel", 2)),
+        )
+    raise ForgeError("Provide 'examples' [{text,label}] or 'fromDatasets' {labelBy}.")
+
+
+@app.route('/api/forge/train', methods=['POST'])
+@rate_limit(max_calls=10, window_seconds=60)
+def api_forge_train():
+    """Forge a router: kind nano (trained), embed (needs local Ollama), or llm."""
+    if not forge_store:
+        return jsonify({"error": "forge not ready"}), 503
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    kind = data.get("kind", "nano")
+    task = data.get("task", "")
+    if not name:
+        return jsonify({"error": "Router needs a 'name'."}), 400
+    try:
+        if kind == "nano":
+            artifact = train_nano(_forge_examples_from_request(data), name=name, task=task)
+        elif kind == "embed":
+            embed_model = data.get("embeddingModel", "nomic-embed-text")
+            artifact = build_embed(
+                _forge_examples_from_request(data), name=name, task=task,
+                embed_fn=ollama_embed_fn(model=embed_model),
+                embedding_model=embed_model,
+            )
+        elif kind == "llm":
+            artifact = build_llm(data.get("labels") or [], name=name, task=task)
+        else:
+            return jsonify({"error": "kind must be nano, embed, or llm."}), 400
+    except ForgeError as err:
+        return jsonify({"error": str(err)}), 400
+    except Exception as err:  # embed_fn network failures land here
+        return jsonify({"error": f"Forge failed: {err}"}), 502
+    version = forge_store.save(artifact)
+    size = len(json.dumps(artifact))
+    log.info(f"Forged router {name} v{version} kind={kind} size={size}B")
+    return jsonify({
+        "name": name, "version": version, "kind": kind,
+        "labels": artifact["labels"], "trainedOn": artifact["trainedOn"],
+        "size_bytes": size, "under_1mb": size < 1024 * 1024,
+    }), 201
+
+
+@app.route('/api/forge/routers', methods=['GET'])
+def api_forge_list():
+    """Registry: every forged router at its latest version."""
+    if not forge_store:
+        return jsonify({"error": "forge not ready"}), 503
+    return jsonify({"routers": forge_store.list()})
+
+
+@app.route('/api/forge/<name>/route', methods=['POST'])
+def api_forge_route(name):
+    """Test-drive a router live: {text} -> {label, confidence, scores}."""
+    if not forge_store:
+        return jsonify({"error": "forge not ready"}), 503
+    artifact = forge_store.get(name, version=request.args.get("version", type=int))
+    if artifact is None:
+        return jsonify({"error": f"No router named '{name}'."}), 404
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    try:
+        runtime = RouterRuntime.load(
+            artifact,
+            embed_fn=ollama_embed_fn(model=artifact["model"].get("embeddingModel", "nomic-embed-text"))
+            if artifact["kind"] == "embed" else None,
+            llm_fn=(lambda prompt: str((cloud_router.ask(prompt) or {}).get("response", "")))
+            if artifact["kind"] == "llm" and cloud_router else None,
+        )
+        return jsonify(runtime.route(text))
+    except ForgeError as err:
+        return jsonify({"error": str(err)}), 400
+    except Exception as err:
+        return jsonify({"error": f"Routing failed: {err}"}), 502
+
+
+@app.route('/api/forge/<name>/export', methods=['GET'])
+def api_forge_export(name):
+    """Download the artifact JSON — this is what gets attached anywhere."""
+    if not forge_store:
+        return jsonify({"error": "forge not ready"}), 503
+    artifact = forge_store.get(name, version=request.args.get("version", type=int))
+    if artifact is None:
+        return jsonify({"error": f"No router named '{name}'."}), 404
+    return jsonify(artifact)
+
+
+@app.route('/api/forge/<name>', methods=['DELETE'])
+def api_forge_delete(name):
+    """Remove every version of a named router."""
+    if not forge_store:
+        return jsonify({"error": "forge not ready"}), 503
+    removed = forge_store.delete(name)
+    if removed == 0:
+        return jsonify({"error": f"No router named '{name}'."}), 404
+    return jsonify({"deleted": name, "versions_removed": removed})
+
+
+@app.route('/api/forge/fetch-script', methods=['POST'])
+def api_forge_fetch_script():
+    """Generate a download script for any public model (ollama/huggingface/url).
+
+    Returns script TEXT for you to run on the target machine; nothing executes
+    on the server."""
+    if not forge_store:
+        return jsonify({"error": "forge not ready"}), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(build_fetch_script(
+            source=data.get("source", ""),
+            ref=data.get("ref", ""),
+            dest=data.get("dest", "models"),
+        ))
+    except ForgeError as err:
+        return jsonify({"error": str(err)}), 400
 
 # ============================================================================
 # HUB PAGE

@@ -138,10 +138,17 @@ class DatasetStore:
                     created_at TEXT,
                     updated_at TEXT NOT NULL,
                     message_count INTEGER NOT NULL DEFAULT 0,
-                    ingested_at TEXT NOT NULL
+                    ingested_at TEXT NOT NULL,
+                    branch TEXT NOT NULL DEFAULT 'main'
                 )
                 """
             )
+            # Databases created before branches existed get the column added.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(conversations)")}
+            if "branch" not in cols:
+                conn.execute(
+                    "ALTER TABLE conversations ADD COLUMN branch TEXT NOT NULL DEFAULT 'main'"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -187,8 +194,16 @@ class DatasetStore:
                     (conv_id, content),
                 )
 
-    def ingest(self, payload: Dict) -> Dict:
-        """Upsert every conversation in a parsed payload. Newer updatedAt wins."""
+    def ingest(self, payload: Dict, branch: str = "main") -> Dict:
+        """Upsert every conversation in a parsed payload. Newer updatedAt wins.
+
+        branch names the dataset room shelf this import belongs to ('main',
+        'claude-exports', 'game-chat', ...). Re-importing a conversation into
+        a different branch moves it there when the copy is newer.
+        """
+        if not isinstance(branch, str) or not branch.strip():
+            branch = "main"
+        branch = branch.strip()
         added = updated = unchanged = 0
         with self._lock:
             conn = self._connect()
@@ -210,8 +225,8 @@ class DatasetStore:
                     conn.execute(
                         """
                         INSERT INTO conversations
-                            (id, title, model_id, project_id, created_at, updated_at, message_count, ingested_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (id, title, model_id, project_id, created_at, updated_at, message_count, ingested_at, branch)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             title = excluded.title,
                             model_id = excluded.model_id,
@@ -219,7 +234,8 @@ class DatasetStore:
                             created_at = excluded.created_at,
                             updated_at = excluded.updated_at,
                             message_count = excluded.message_count,
-                            ingested_at = excluded.ingested_at
+                            ingested_at = excluded.ingested_at,
+                            branch = excluded.branch
                         """,
                         (
                             conv["id"],
@@ -230,6 +246,7 @@ class DatasetStore:
                             conv["updatedAt"],
                             len(messages),
                             datetime.utcnow().isoformat(),
+                            branch,
                         ),
                     )
                     self._replace_messages(conn, conv["id"], messages)
@@ -297,11 +314,49 @@ class DatasetStore:
             latest = conn.execute(
                 "SELECT MAX(updated_at) AS latest FROM conversations"
             ).fetchone()["latest"]
+            branches = {
+                r["branch"]: r["n"]
+                for r in conn.execute(
+                    "SELECT branch, COUNT(*) AS n FROM conversations GROUP BY branch"
+                )
+            }
             return {
                 "conversations": convs,
                 "messages": msgs,
                 "latest_updated_at": latest,
+                "branches": branches,
                 "fts_enabled": self.fts_enabled,
             }
         finally:
             conn.close()
+
+    def labeled_examples(self, label_by: str = "project_id", role: str = "user",
+                         branch: Optional[str] = None,
+                         min_per_label: int = 2) -> List[Tuple[str, str]]:
+        """(text, label) pairs for router training, straight from the datasets.
+
+        label_by: 'project_id', 'model_id', or 'branch' — whichever grouping
+        the router should learn to tell apart. Labels rarer than min_per_label
+        are dropped so a one-off cannot become a class.
+        """
+        if label_by not in ("project_id", "model_id", "branch"):
+            raise ValueError("label_by must be project_id, model_id, or branch")
+        conn = self._connect()
+        try:
+            sql = (
+                f"SELECT m.content AS text, c.{label_by} AS label "
+                "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+                f"WHERE c.{label_by} IS NOT NULL AND c.{label_by} != '' "
+                "AND m.content != '' AND m.role = ?"
+            )
+            params: List = [role]
+            if branch is not None:
+                sql += " AND c.branch = ?"
+                params.append(branch)
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        counts: Dict[str, int] = {}
+        for r in rows:
+            counts[r["label"]] = counts.get(r["label"], 0) + 1
+        return [(r["text"], r["label"]) for r in rows if counts[r["label"]] >= min_per_label]
