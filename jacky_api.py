@@ -1118,6 +1118,58 @@ def api_metrics():
     })
 
 # ============================================================================
+# PERSONAL DATASETS — Off Grid mobile backup ingest + search
+# The iPhone workstation exports conversations (Storage -> Backup -> Export
+# data); POSTing that file here folds it into the local dataset. Same merge
+# rule as the app: newer updatedAt wins, nothing local is deleted.
+# ============================================================================
+
+dataset_store = None
+try:
+    from dataset_ingest import DatasetStore, parse_offgrid_backup, BackupValidationError
+    dataset_store = DatasetStore(os.environ.get("JACKY_DATASETS_DB", "jacky_datasets.db"))
+except Exception as e:  # pragma: no cover - import guard mirrors engine init style
+    log.warning(f"Dataset ingest unavailable: {e}")
+
+
+@app.route('/api/datasets/ingest', methods=['POST'])
+@rate_limit(max_calls=10, window_seconds=60)
+def api_datasets_ingest():
+    """Ingest an Off Grid backup JSON file (request body = the exported file)."""
+    if not dataset_store:
+        return jsonify({"error": "dataset store not ready"}), 503
+    raw = request.get_json(silent=True)
+    if raw is None:
+        return jsonify({"error": "Body must be the exported backup JSON."}), 400
+    try:
+        payload, skipped = parse_offgrid_backup(raw)
+    except BackupValidationError as err:
+        return jsonify({"error": str(err)}), 400
+    counts = dataset_store.ingest(payload)
+    counts["skipped"] = skipped
+    return jsonify(counts), 200
+
+
+@app.route('/api/datasets/search', methods=['GET'])
+def api_datasets_search():
+    """Full-text search across every ingested conversation message."""
+    if not dataset_store:
+        return jsonify({"error": "dataset store not ready"}), 503
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"error": "Missing query parameter q."}), 400
+    limit = request.args.get("limit", 20, type=int)
+    return jsonify({"query": query, "results": dataset_store.search(query, limit)})
+
+
+@app.route('/api/datasets/stats', methods=['GET'])
+def api_datasets_stats():
+    """Dataset totals for the dashboard."""
+    if not dataset_store:
+        return jsonify({"error": "dataset store not ready"}), 503
+    return jsonify(dataset_store.stats())
+
+# ============================================================================
 # HUB PAGE
 # ============================================================================
 
