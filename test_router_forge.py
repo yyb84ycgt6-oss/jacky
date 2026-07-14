@@ -10,7 +10,11 @@ import json
 
 import pytest
 
+import sys
+import types
+
 from dataset_ingest import DatasetStore, parse_offgrid_backup
+import router_forge
 from router_forge import (
     FORGE_FORMAT,
     ForgeError,
@@ -20,6 +24,7 @@ from router_forge import (
     build_fetch_script,
     build_llm,
     extract_features,
+    resolve_embed_fn,
     train_nano,
     validate_artifact,
 )
@@ -178,6 +183,76 @@ class TestEmbed:
 
         with pytest.raises(ForgeError, match="inconsistent"):
             build_embed(examples(), name="bad", embed_fn=bad_embed)
+
+
+# ---------------------------------------------------------------------------
+# Embedder resolution — the single mapping used by train and route alike
+# ---------------------------------------------------------------------------
+
+class _StubMiniLM:
+    """Stands in for SentenceTransformer at the heavy-native-lib boundary."""
+
+    calls = []
+
+    def __init__(self, name):
+        self.name = name
+
+    def encode(self, text, normalize_embeddings=False):
+        _StubMiniLM.calls.append({"text": text, "normalized": normalize_embeddings})
+        return [0.6, 0.8, 0.0]  # already unit length
+
+
+@pytest.fixture
+def stub_sentence_transformers(monkeypatch):
+    module = types.ModuleType("sentence_transformers")
+    module.SentenceTransformer = _StubMiniLM
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+    monkeypatch.setattr(router_forge, "_minilm_models", {})
+    _StubMiniLM.calls = []
+    return module
+
+
+class TestResolveEmbedFn:
+    def test_minilm_names_route_to_sentence_transformers(self, stub_sentence_transformers):
+        fn = resolve_embed_fn("sentence-transformers/all-MiniLM-L6-v2")
+        vec = fn("hello there")
+        assert vec == [0.6, 0.8, 0.0]
+        assert _StubMiniLM.calls[0]["normalized"] is True
+
+    def test_minilm_match_is_case_insensitive(self, stub_sentence_transformers):
+        fn = resolve_embed_fn("all-minilm-l6-v2")
+        assert fn("x") == [0.6, 0.8, 0.0]
+
+    def test_model_instance_is_cached(self, stub_sentence_transformers):
+        resolve_embed_fn("all-MiniLM-L6-v2")("one")
+        resolve_embed_fn("all-MiniLM-L6-v2")("two")
+        assert len(router_forge._minilm_models) == 1
+
+    def test_missing_dependency_gives_install_hint(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+        monkeypatch.setattr(router_forge, "_minilm_models", {})
+        with pytest.raises(ForgeError, match="pip install -U sentence-transformers"):
+            resolve_embed_fn("all-MiniLM-L6-v2")
+
+    def test_other_names_route_to_ollama(self, stub_sentence_transformers):
+        # ollama_embed_fn imports requests and returns a closure; no network
+        # happens until the closure is called.
+        fn = resolve_embed_fn("nomic-embed-text")
+        assert callable(fn)
+        assert _StubMiniLM.calls == []
+
+    def test_empty_name_defaults_to_ollama(self, stub_sentence_transformers):
+        assert callable(resolve_embed_fn(""))
+        assert _StubMiniLM.calls == []
+
+    def test_full_embed_router_through_minilm_stub(self, stub_sentence_transformers):
+        fn = resolve_embed_fn("all-MiniLM-L6-v2")
+        artifact = build_embed(examples(), name="stub-embed", embed_fn=fn,
+                               embedding_model="all-MiniLM-L6-v2")
+        result = RouterRuntime.load(artifact, embed_fn=fn).route("anything")
+        assert result["label"] in ("tech", "cook")
+        assert artifact["model"]["embeddingModel"] == "all-MiniLM-L6-v2"
+        assert artifact["model"]["dims"] == 3
 
 
 # ---------------------------------------------------------------------------

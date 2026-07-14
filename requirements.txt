@@ -26,6 +26,12 @@ python-json-logger>=2.0.0
 # Local model integration
 # ollama>=0.1.0  (optional, for direct Ollama calls)
 
+# Router Forge embed routers (optional - pulls torch, ~1 GB; nano and llm
+# routers need nothing). Install to use embeddingModel values containing
+# "MiniLM" (e.g. sentence-transformers/all-MiniLM-L6-v2, 384d, the same
+# family the Off Grid phone app bundles):
+# sentence-transformers>=3.0.0
+
 # Dev/testing
 pytest>=7.0.0
 pytest-cov>=4.0.0

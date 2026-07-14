@@ -1183,7 +1183,7 @@ try:
     from router_forge import (
         ForgeStore, RouterRuntime, ForgeError,
         train_nano, build_embed, build_llm, build_fetch_script,
-        ollama_embed_fn,
+        resolve_embed_fn,
     )
     forge_store = ForgeStore(os.environ.get("JACKY_FORGE_DB", "jacky_forge.db"))
 except Exception as e:  # pragma: no cover - import guard mirrors engine init style
@@ -1227,7 +1227,7 @@ def api_forge_train():
             embed_model = data.get("embeddingModel", "nomic-embed-text")
             artifact = build_embed(
                 _forge_examples_from_request(data), name=name, task=task,
-                embed_fn=ollama_embed_fn(model=embed_model),
+                embed_fn=resolve_embed_fn(embed_model),
                 embedding_model=embed_model,
             )
         elif kind == "llm":
@@ -1269,7 +1269,7 @@ def api_forge_route(name):
     try:
         runtime = RouterRuntime.load(
             artifact,
-            embed_fn=ollama_embed_fn(model=artifact["model"].get("embeddingModel", "nomic-embed-text"))
+            embed_fn=resolve_embed_fn(artifact["model"].get("embeddingModel", ""))
             if artifact["kind"] == "embed" else None,
             llm_fn=(lambda prompt: str((cloud_router.ask(prompt) or {}).get("response", "")))
             if artifact["kind"] == "llm" and cloud_router else None,

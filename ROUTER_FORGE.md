@@ -10,7 +10,7 @@ moves. The forge does not care what they mean.
 | Kind | Size | How it decides | When to use |
 |---|---|---|---|
 | `nano` | 50-300 KB (under 1 MB) | hashed char n-grams -> logistic regression, int8 | everywhere; runs in pure Python or ~100 lines of TS on the phone |
-| `embed` | few KB + host's embedder | cosine vs per-label centroids (Ollama embeddings) | when nano accuracy is not enough and an embedder is nearby |
+| `embed` | few KB + host's embedder | cosine vs per-label centroids (MiniLM or Ollama embeddings) | when nano accuracy is not enough and an embedder is nearby |
 | `llm` | 1 KB prompt spec | any LLM classifies (local Ollama or cloud waterfall) | instant to forge, heavyweight to run, best for rare/complex routing |
 
 All three share one artifact format (`router-forge` v1) and one runtime:
@@ -123,6 +123,27 @@ curl -X POST http://localhost:5000/api/forge/fetch-script \
 
 `fromDatasets` options: `labelBy` (`project_id`, `model_id`, `branch`),
 `role` (default `user`), `branch` (filter), `minPerLabel` (default 2).
+
+## Embed routers: choosing the embedder
+
+`kind: "embed"` picks its embedder from the `embeddingModel` string. Names
+containing `MiniLM` run through sentence-transformers
+(`pip install -U sentence-transformers`); anything else is asked of local
+Ollama (`http://localhost:11434`).
+
+```sh
+curl -X POST http://localhost:5000/api/forge/train \
+  -H "Content-Type: application/json" \
+  -d '{"name": "project-dispatch-embed", "kind": "embed",
+       "embeddingModel": "sentence-transformers/all-MiniLM-L6-v2",
+       "fromDatasets": {"labelBy": "project_id"}}'
+```
+
+Why MiniLM matters: it is the same 384-dim family the Off Grid phone app
+bundles as `all-MiniLM-L6-v2-Q8_0.gguf` (24 MB). Centroids forged on the PC
+with MiniLM live in the vector space the phone can compute offline; Q8_0
+quantization shifts vectors only slightly and centroid cosine tolerates it.
+That is the path to one embed artifact running on every tier.
 
 ## Environment
 

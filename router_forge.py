@@ -261,6 +261,46 @@ def ollama_embed_fn(model: str = "nomic-embed-text",
     return embed
 
 
+_minilm_models: Dict[str, object] = {}
+
+
+def minilm_embed_fn(
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+) -> Callable[[str], List[float]]:
+    """Adapter: sentence-transformers MiniLM, the same 384-dim family the
+    phone bundles as all-MiniLM-L6-v2-Q8_0. normalize_embeddings=True gives
+    the mean-pooled, L2-normalized vectors (same math as the reference
+    tokenize -> mean_pooling -> F.normalize pipeline). The heavy torch
+    dependency is imported lazily and the model instance is cached."""
+    try:
+        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
+    except ImportError:
+        raise ForgeError(
+            "sentence-transformers is not installed. Run: pip install -U sentence-transformers"
+        )
+    if model_name not in _minilm_models:
+        _minilm_models[model_name] = SentenceTransformer(model_name)
+    model = _minilm_models[model_name]
+
+    def embed(text: str) -> List[float]:
+        vec = model.encode(text, normalize_embeddings=True)
+        return [float(v) for v in vec]
+
+    return embed
+
+
+def resolve_embed_fn(embedding_model: str) -> Callable[[str], List[float]]:
+    """The one mapping from an artifact's embeddingModel string to an adapter.
+
+    Names containing 'minilm' (any case) run through sentence-transformers;
+    everything else is treated as a local Ollama embedding model. Train and
+    route must both resolve through here so the decision exists once."""
+    name = (embedding_model or "").strip() or "nomic-embed-text"
+    if "minilm" in name.lower():
+        return minilm_embed_fn(model_name=name)
+    return ollama_embed_fn(model=name)
+
+
 # ---------------------------------------------------------------------------
 # LLM router: a prompt spec any engine can execute.
 # ---------------------------------------------------------------------------
